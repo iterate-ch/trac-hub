@@ -8,7 +8,16 @@ require 'sequel'
 require 'yaml'
 require 'set'
 require 'singleton'
-require 'uri'
+require 'digest'
+require 'gqli'
+require 'git'
+
+module LabelTypes
+  TYPE = 'type'
+  PRIORITY = 'priority'
+  COMPONENT = 'component'
+  PLATFORM = 'platform'
+end
 
 class GracefulQuit
   include Singleton
@@ -43,24 +52,97 @@ class Migrator
     @token = github["token"]
 
     @users = Hash[users]
-    @labels = Hash[labels.map { |cat, rx| [cat, Hash[rx] ] }]
+    @labels = Hash[labels.map { |cat, rx| [cat, Hash[rx]] }]
     @ticket_to_issue = {}
     @trac_mails_cache = Hash.new
+    @gclient = GQLi::Client.new(
+      "https://api.github.com/graphql",
+      headers: { "Authorization" => "token #{@token}" },
+      validate_query: false
+    )
 
-    $logger.debug("Get highest in #{@repo}")
-    issues = JSON.parse(RestClient.get(
-        "https://api.github.com/repos/#{@repo}/issues",
-        {"Authorization" => "token #{@token}",
-         params: {
-            filter: "all",
+    # create milestones hash
+    @milestones = Hash.new
+    page = 1
+    loop do
+      ms = JSON.parse(RestClient.get(
+        "https://api.github.com/repos/#{@repo}/milestones",
+        { "Authorization" => "token #{@token}",
+          params: {
+            page: page,
             state: "all",
-            sort: "created",
-            direction: "desc",
-        }}
-    ))
-    @last_created_issue = issues.empty? ? 0 : issues[0]["number"].to_i
+            per_page: "100"
+          } }
+      ))
+      if ms.length == 0
+        break
+      end
+      @milestones.merge!(ms.map {
+        |x| [x["title"], x["html_url"]]
+      }.to_h)
+      page += 1
+    end
+
+    #findMapping
+
+    #deleteDummyTickets
+    comps = @repo.split("/")
+    query = GQLi::DSL.query {
+      repository(owner: comps[0], name: comps[1]) {
+        issues(last: 1) {
+          edges {
+            node {
+              number
+            }
+          }
+        }
+      }
+    }
+    result = @gclient.execute(query)
+    @last_created_issue = 0
+    edges = result.data.repository.issues.edges
+    @last_created_issue = edges[0].node.number unless edges.empty?
 
     $logger.info("Last created issue on GitHub is '#{@last_created_issue}'")
+
+    # $logger.debug("Get all labels")
+    # page = 1
+    # existingLabels = []
+    # loop do
+    #   rlabels = JSON.parse(RestClient.get(
+    #     "https://api.github.com/repos/#{@repo}/labels",
+    #     { "Authorization" => "token #{@token}",
+    #       params: {
+    #         page: page,
+    #         per_page: "100"
+    #       } }
+    #   ))
+    #   if rlabels.length() == 0
+    #     break
+    #   end
+    #   rlabels.each do |label|
+    #     existingLabels << label['name']
+    #   end
+    #   page += 1
+    # end
+    #
+    # $logger.info("Create missing labels")
+    # @labels.each do |cat|
+    #   type = cat[0]
+    #   $logger.info("Processing type #{type}")
+    #   cat[1].values.each do |v|
+    #     l = "#{type}:#{v}"
+    #     unless existingLabels.include? l
+    #       $logger.info("Creating label #{l}")
+    #       JSON.parse(RestClient.post(
+    #         "https://api.github.com/repos/#{@repo}/labels",
+    #         { "name" => l }.to_json,
+    #         { "Authorization" => "token #{@token}",
+    #           "Content-Type" => "application/json",
+    #           "Accept" => "application/vnd.github.v3+json" }))
+    #     end
+    #   end
+    # end
 
     @revmap = revmap
     @attachurl = attachurl
@@ -68,9 +150,117 @@ class Migrator
     @safetychecks = safetychecks
   end
 
+  def findMapping()
+    $logger.info("Find mapping")
+
+    Git.configure do |config|
+      # If you want to use a custom git binary
+      config.binary_path = '/usr/local/bin/git'
+    end
+
+    g = Git.open("/Users/yla/workspace/cyberduck", :log => Logger.new(STDOUT))
+    gitlog = g.log(1000000)
+
+    open('missing-mappings.out', 'a') do |f|
+      revisions = File.readlines('missing.out', chomp: true).uniq
+      revisions.each do |revision|
+        found = false
+        #$logger.info("Processing " + revision)
+        data = @trac.revisions.select().filter(:rev => revision.rjust(10, '0')).first
+        if data
+          gitlog.each do |commit|
+            if commit.date == Time.at(data[:time] / 1000000)
+              f << "r#{revision} #{commit.sha}\n"
+              found = true
+              break
+            end
+          end
+        else
+          if !found
+            $logger.info("Revision #{revision} not mapped")
+          end
+        end
+      end
+    end
+    exit
+  end
+
+  def deleteDummyTickets()
+    $logger.info("Delete dummy tickets")
+    page = 1
+    loop do
+      issues = JSON.parse(RestClient.get(
+        "https://api.github.com/repos/#{@repo}/issues",
+        { "Authorization" => "token #{@token}",
+          params: {
+            filter: "all",
+            state: "all",
+            sort: "created",
+            direction: "desc",
+            page: page,
+            per_page: 100
+          } }
+      ))
+      if issues.length() == 0
+        break
+      end
+      issues.each do |issue|
+        if issue["title"].include? "dummy"
+          $logger.info("Delete dummy ticket " + issue["number"].to_s)
+          query = GQLi::DSL.mutation {
+            deleteIssue(input: { issueId: "#{issue['node_id']}" }) {
+              clientMutationId
+            }
+          }
+          @gclient.execute(query)
+        end
+      end
+      page += 1
+    end
+  end
+
+  def migrateVersions
+
+    # milestones löschen
+=begin
+    n = 1
+    while true
+      RestClient.delete(
+        "https://api.github.com/repos/#{@repo}/milestones/#{n}",
+        { "Authorization" => "token #{@token}",
+          "Content-Type" => "application/json",
+          "Accept" => "application/vnd.github.v3+json" })
+      n+=1
+    end
+=end
+
+    n = 0
+
+    @trac.milestones.all.each do |milestone|
+      $logger.info("Processing milestone #{milestone[:name]}")
+
+      description = ""
+      description = "*Closed on #{Time.at(milestone[:completed] / 1000000).utc}*" if milestone[:completed] > 0
+      description = description + "\n\n" + milestone[:description] unless milestone[:description].nil?
+
+      request = {}
+      request["title"] = milestone[:name]
+      request["state"] = milestone[:completed] > 0 ? "closed" : "open"
+      request["description"] = description unless description.empty?
+      request["due_on"] = Time.at(milestone[:due] / 1000000).utc.iso8601 if milestone[:due] > 0
+
+      response = JSON.parse(RestClient.post(
+        "https://api.github.com/repos/#{@repo}/milestones",
+        request.to_json,
+        { "Authorization" => "token #{@token}",
+          "Content-Type" => "application/json",
+          "Accept" => "application/vnd.github.v3+json" }))
+    end
+  end
+
   def migrate(start_ticket = -1, filterout_closed = false)
     if start_ticket == -1
-      start_ticket = @last_created_issue+1
+      start_ticket = @last_created_issue + 1
     end
     GracefulQuit.enable
     migrate_tickets(start_ticket, filterout_closed)
@@ -82,7 +272,12 @@ class Migrator
   def trac_mail(author)
     return @trac_mails_cache[author] if @trac_mails_cache.has_key?(author)
     # tries to retrieve the email from trac db
-    data = @trac.sessions.select(:value).where('name = "email" AND sid = ?', author)
+    #data = @trac.sessions.select(:value).where('name = "email" AND sid = ?', author)
+    data = @trac.sessions.select(:value).filter(:name => 'email').filter(:sid => author)
+
+    $logger.info("trac_mail -> data found " + author)
+
+    #exit
     return (@trac_mails_cache[author] = data.first[:value]) if data.count == 1
     return (@trac_mails_cache[author] = author) # not found
   end
@@ -90,15 +285,29 @@ class Migrator
   # returns the git commit hash for a specified revision (using revmap hash)
   def map_changeset(str)
     if @revmap and @revmap.has_key?(str)
-      return "[r#{str}](../commit/#{@revmap[str]})"
+      return "#{@revmap[str]}"
     else
       return str
     end
   end
 
+  # returns the milestone URL (using a map)
+  def map_milestone(label, milestone)
+    if @milestones and @milestones.has_key?(milestone)
+      if label
+        return "[#{label}](#{@milestones[milestone]})"
+      else
+        return "[#{milestone}](#{@milestones[milestone]})"
+      end
+    else
+      $logger.info("Milestone #{milestone} not found")
+      return "[milestone:#{milestone} #{milestone}]"
+    end
+  end
+
   # Format time for github API
   def format_time(time)
-    time = Time.at(time/1e6, time%1e6)
+    time = Time.at(time / 1e6, time % 1e6)
     return time.strftime("%FT%TZ")
   end
 
@@ -106,40 +315,66 @@ class Migrator
   def migrate_tickets(start_ticket, filterout_closed)
     $logger.info('migrating issues')
     # We match the issue title to determine whether an issue exists already.
-    @trac.tickets.order(:id).where{id >= start_ticket}.all.each do |ticket|
+    @trac.tickets.order(:id).where { id >= start_ticket }.all.each do |ticket|
       next if filterout_closed and ticket[:status] == "closed"
       GracefulQuit.check("quitting after processing ticket ##{@last_created_issue}")
 
-      if @safetychecks; begin
-        # issue exists already:
-        issue = JSON.parse(RestClient.get(
+      if @safetychecks;
+        begin
+          # issue exists already:
+          issue = JSON.parse(RestClient.get(
             "https://api.github.com/repos/#{@repo}/issues/#{ticket[:id]}",
-            {"Authorization" => "token #{@token}"}))
-        $logger.info("found ticket #{ticket[:id]}")
-        next
-      rescue
-      end end
+            { "Authorization" => "token #{@token}" }))
+          $logger.info("found ticket #{ticket[:id]}")
+          next
+        rescue
+        end
+      end
 
       begin
-        $logger.info("creating issue #{ticket[:id]} (#{ticket[:reporter]})")
+        # check if there is gap in numbering in case of deleted trac tickets
+        if @last_created_issue + 1 < ticket[:id]
+          $logger.info("Next issue will be #{@last_created_issue + 1} but TRAC ticket number to migrate is #{ticket[:id]} - create dummy ticket(s)")
+          dummy = {
+            "issue" => { "title" => "dummy", "body" => "dummy", "closed" => true, "created_at" => "1900-01-01T00:00:00Z" },
+            "comments" => []
+          }
+          (ticket[:id] - (@last_created_issue + 1)).times {
+            $logger.info("Create dummy ticket")
+            response = JSON.parse(RestClient.post(
+              "https://api.github.com/repos/#{@repo}/import/issues",
+              dummy.to_json,
+              { "Authorization" => "token #{@token}",
+                "Content-Type" => "application/json",
+                "Accept" => "application/vnd.github.golden-comet-preview+json" }))
+            while response["status"] == "pending"
+              sleep 1.0
+              $logger.info("Checking import status: #{response['id']}")
+              response = JSON.parse(RestClient.get(response['url'], {
+                "Authorization" => "token #{@token}",
+                "Accept" => "application/vnd.github.golden-comet-preview+json" }))
+            end
+          }
+        end
 
+        $logger.info("creating issue #{ticket[:id]} (#{ticket[:reporter]})")
         # API details: https://gist.github.com/jonmagic/5282384165e0f86ef105
         request = compose_issue(ticket)
         response = JSON.parse(RestClient.post(
           "https://api.github.com/repos/#{@repo}/import/issues",
           request.to_json,
-          {"Authorization" => "token #{@token}",
-           "Content-Type" => "application/json",
-           "Accept" => "application/vnd.github.golden-comet-preview+json"}))
+          { "Authorization" => "token #{@token}",
+            "Content-Type" => "application/json",
+            "Accept" => "application/vnd.github.golden-comet-preview+json" }))
       end
 
       if @safetychecks
         while response["status"] == "pending"
-          sleep 0.1
+          sleep 1.0
           $logger.info("Checking import status: #{response['id']}")
           response = JSON.parse(RestClient.get(response['url'], {
             "Authorization" => "token #{@token}",
-            "Accept" => "application/vnd.github.golden-comet-preview+json"}))
+            "Accept" => "application/vnd.github.golden-comet-preview+json" }))
         end
         $logger.info("Status: #{response['status']}")
         issue_id = response["issue_url"].match(/\d+$/).to_s.to_i
@@ -155,25 +390,38 @@ class Migrator
         # to allow manual verification:
         $logger.info(response['url'])
       end
+
+      # lock ticket if it's closed
+      if ticket[:status] == "closed"
+        RestClient.put(
+          "https://api.github.com/repos/#{@repo}/issues/#{ticket[:id]}/lock",
+          { "lock_reason" => "resolved" }.to_json,
+          { "Authorization" => "token #{@token}",
+            "Content-Type" => "application/json",
+            "Accept" => "application/vnd.github.v3+json" })
+      end
+
       @last_created_issue = ticket[:id]
+
+      #exit
     end
   end
 
   def compose_issue(ticket)
 
     body = ""
-    body += "*Issue migrated from trac ticket # #{ticket[:id]}*\n\n"
+    #body += "*Issue migrated from trac ticket # #{ticket[:id]}*\n\n"
     closed = nil
 
     # summary line:
-    body += [:component, :priority, :resolution, :keywords].map{
-        |cat| ticket[cat] and not ticket[cat].lstrip.empty? and
-              "**#{cat.to_s}:** #{ticket[cat]}"
-    }.select{|x| x}.join(" | ")
+    # body += [:component, :priority, :resolution, :keywords].map {
+    #   |cat| ticket[cat] and not ticket[cat].lstrip.empty? and
+    #     "**#{cat.to_s}:** #{ticket[cat]}"
+    # }.select { |x| x }.join(" | ")
 
     # Initial report
     # TODO: respect ticket[:changetime]
-    body += "\n\n" if not @singlepost
+    # body += "\n\n" if not @singlepost
     body += ticket_change(@singlepost, {
       ticket: ticket[:id],
       time: ticket[:time],
@@ -183,34 +431,46 @@ class Migrator
       newvalue: ticket[:description],
     })["body"]
 
+    # Attachments
+    #
+    @trac.attachments.where(:type => 'ticket', :id => ticket[:id]).all.each_with_index do |attachment, i|
+      body += "\n___\nAttachments\n" if i == 0
+      name = attachment[:filename]
+      size = attachment[:size]
+      url = @attachurl + "/#{ticket[:id]}/" + CGI.escape(name).gsub("+", "%20")
+      text = "\n* [`#{name}`](#{url})"
+      text += " (#{(size / 1024.0).round(1)} KiB)"
+      body += text
+    end
+
     # combine the changes and attachment table results and sort them by date
     changes = @trac.changes.where(:ticket => ticket[:id]).collect.to_a
     changes += @trac.attachments.where(:type => 'ticket', :id => ticket[:id]).collect.to_a
-    changes = changes.sort_by{|x| x[:time]}
+    changes = changes.sort_by { |x| x[:time] }
 
     # replay all changes in chronological order:
-    comments = changes.map{|x| ticket_change(@singlepost, x)}.select{|x| x}.to_a
+    comments = changes.map { |x| ticket_change(@singlepost, x) }.select { |x| x }.to_a
     if @singlepost
-      body += comments.map{|x| x["body"]}.join("\n")
+      body += comments.map { |x| x["body"] }.join("\n")
       comments = []
     end
 
     labels = Set[]
     changes.each do |x|
-      del = @labels.fetch(x[:field], Hash[])[x[:oldvalue]]
-      add = @labels.fetch(x[:field], Hash[])[x[:newvalue]]
-      labels.delete(del) if del
-      labels.add(add) if add
+      # del = @labels.fetch(x[:field], Hash[])[x[:oldvalue]]
+      # add = @labels.fetch(x[:field], Hash[])[x[:newvalue]]
+      # labels.delete(del) if del
+      # labels.add(add) if add
       if x[:field] == "status" and x[:newvalue] == "closed"
         closed = x[:time]
       end
     end
-    labels.add(@labels.fetch('component', Hash[])[ticket[:component]])
-    labels.add(@labels.fetch('type', Hash[])[ticket[:type]])
-    labels.add(@labels.fetch('resolution', Hash[])[ticket[:resolution]])
-    labels.add(@labels.fetch('priority', Hash[])[ticket[:priority]])
-    labels.add(@labels.fetch('severity', Hash[])[ticket[:severity]])
-    labels.add(@labels.fetch('version', Hash[])[ticket[:version]])
+    labels.add('component:' + @labels.fetch('component', Hash[])[ticket[:component]])
+    labels.add('type:' + @labels.fetch('type', Hash[])[ticket[:type]])
+    labels.add('resolution:' + @labels.fetch('resolution', Hash[])[ticket[:resolution]]) unless ticket[:resolution].nil? || ticket[:resolution].empty?
+    labels.add('priority:' + @labels.fetch('priority', Hash[])[ticket[:priority]])
+    # labels.add(@labels.fetch('severity', Hash[])[ticket[:severity]])
+    labels.add('version:' + @labels.fetch('version', Hash[])[ticket[:version]]) unless ticket[:version].nil? || ticket[:version].empty?
     # If the field is not set, it will be nil and generate an unprocessable json
     labels.delete(nil)
 
@@ -254,7 +514,7 @@ class Migrator
 
     # time
     time = meta[:time]
-    time = Time.at(time/1e6, time%1e6)
+    time = Time.at(time / 1e6, time % 1e6)
 
     # author
     author = meta[:author]
@@ -263,61 +523,76 @@ class Migrator
       author = "@" + @users[author]
     end
 
+    pos = author.index("@")
+    unless pos.nil? || pos == 0
+      author = (Digest::SHA1.hexdigest author)[0..6]
+    end
+
     text = ""
-    text += "\n___\n" if append
-    text += "#### #{time.strftime("%Y-%m-%d %H:%M:%S")}: #{author} "
+    text += "> **#{author}** "
 
     case kind
-      when 'owner', 'status', 'title', 'resolution', 'priority', 'component', 'type', 'severity', 'platform'
-        old = meta[:oldvalue]
-        new = meta[:newvalue]
-        if old and new
-          text += "changed #{kind} from *#{old}* to *#{new}*"
-        elsif old
-          text += "removed #{kind} (was *#{old}*)"
-        elsif new
-          text += "set #{kind} to *#{new}*"
+    when 'owner', 'status', 'title', 'resolution', 'priority', 'component', 'type', 'severity', 'platform'
+      return nil
+      old = meta[:oldvalue]
+      new = meta[:newvalue]
+      if old and new
+        text += "changed #{kind} from *#{old}* to *#{new}*"
+      elsif old
+        text += "removed #{kind} (was *#{old}*)"
+      elsif new
+        text += "set #{kind} to *#{new}*"
+      end
+
+    when :initial
+      body = meta[:newvalue]
+      text += "created the issue\n\n"
+      if body and not body.lstrip.empty?
+        text += markdownify(body, meta[:ticket])
+      end
+
+    when 'milestone'
+      return nil
+
+    when 'comment'
+      body = meta[:newvalue]
+      text += "commented\n\n"
+      text += markdownify(body, meta[:ticket]) if body
+      return nil if body == nil or body.lstrip.empty?
+
+    when 'attachment'
+      return nil
+      text += "uploaded file "
+      name = meta[:filename]
+      body = meta[:description]
+      if @attachurl
+        # uri = Addressable::URI.parse(@attachurl)
+        # uri.query_values = {title: "My Blog & Your Blog"}
+        # url = uri.normalize.to_s
+
+        url = @attachurl + "/#{meta[:id]}/" + CGI.escape(name).gsub("+", "%20")
+        text += "[`#{name}`](#{url})"
+        if [".png", ".jpg", ".gif"].include? File.extname(name).downcase
+          body += "\n![#{name}](#{url})"
         end
+      else
+        text += "`#{name}`"
+      end
+      text += " (#{(meta[:size] / 1024.0).round(1)} KiB)"
+      text += "\n\n" + body
 
-      when :initial
-        body = meta[:newvalue]
-        text += "created the issue\n\n"
-        if body and not body.lstrip.empty?
-            text += "\n___\n" if not append
-            text += markdownify(body)
-        end
+    when 'description'
+      return nil
+      # (ticket[:description] already contains the new value,
+      # so there is no need to update)
+      text += "edited the issue description"
 
-      when 'comment'
-        body = meta[:newvalue]
-        text += "commented\n\n"
-        text += "\n___\n" if not append
-        text += markdownify(body) if body
-        return nil if body == nil or body.lstrip.empty?
+    when 'keywords', 'cc', 'reporter', 'version'
+      # don't care
+      return nil
 
-      when 'attachment'
-        text += "uploaded file "
-        name = meta[:filename]
-        body = meta[:description]
-        if @attachurl
-          url = URI.escape("#{@attachurl}/#{meta[:id]}/#{name}")
-          text += "[`#{name}`](#{url})"
-          if [".png", ".jpg", ".gif"].include? File.extname(name).downcase
-            body += "\n![#{name}](#{url})"
-          end
-        else
-          text += "`#{name}`"
-        end
-        text += " (#{(meta[:size]/1024.0).round(1)} KiB)"
-        text += "\n\n" + body
-
-      when 'description'
-        # (ticket[:description] already contains the new value,
-        # so there is no need to update)
-        text += "edited the issue description"
-
-      when 'keywords', 'cc', 'reporter', 'version'
-        # don't care
-        return nil
+    else
+      return nil
     end
 
     return {
@@ -326,7 +601,7 @@ class Migrator
     }
   end
 
-  def markdownify(str)
+  def markdownify(str, ticketid)
     # Line endings
     str.gsub!("\r\n", "\n")
     # CommitTicketReference
@@ -341,8 +616,21 @@ class Migrator
     str.gsub!(/\=\=\=\s(.+?)\s\=\=\=/, '### \1')
     str.gsub!(/\=\=\s(.+?)\s\=\=/, '## \1')
     str.gsub!(/\=\s(.+?)\s\=[\s\n]*/, '# \1')
+    # Images
+    str.gsub!(/\[\[Image\((http[^\s\[\]]+)\)\]\]/) { |m|
+      "![external image](#{$1})"
+    }
+    str.gsub!(/\[\[Image\(([^:\[\]]+)\)\]\]/) { |m|
+      filename = "#{$1}"
+      url = @attachurl + "/#{ticketid}/" + CGI.escape(filename).gsub("+", "%20")
+      "![#{filename}](#{url})"
+    }
+    # Line Breaks
+    str.gsub!(/\[\[BR\]\]/, '<br />')
     # Links
+    str.gsub!(/\[\[(http[^\s\[\]]+)\|([^\[\]]+)\]\]/, '[\2](\1)')
     str.gsub!(/\[(http[^\s\[\]]+)\s([^\[\]]+)\]/, '[\2](\1)')
+    str.gsub!(/\[(http[^\s\[\]]+)\]/, '(\1)')
     str.gsub!(/\!(([A-Z][a-z0-9]+){2,})/, '\1')
     # Font styles
     str.gsub!(/'''(.+?)'''/, '**\1**')
@@ -354,21 +642,24 @@ class Migrator
     # Changeset
     str.gsub!(/https?:\/\/svnweb.cern.ch\/trac\/madx\/changeset\/(\d+)\/?/, '[changeset:\1]')
     str.gsub!(/\[changeset:"r(\d+)".*\]/, '[changeset:\1]')
-    str.gsub!(/\[changeset:r(\d+)\]/,     '[changeset:\1]')
-    str.gsub!(/\br(\d+)\b/)              { map_changeset(Regexp.last_match[1]) }
+    str.gsub!(/\[changeset:r(\d+)\]/, '[changeset:\1]')
+    str.gsub!(/\br(\d+)\b/) { map_changeset(Regexp.last_match[1]) }
     str.gsub!(/\[changeset:"(\d+)".*\]/) { map_changeset(Regexp.last_match[1]) }
-    str.gsub!(/\[changeset:(\d+)\]/)     { map_changeset(Regexp.last_match[1]) }
+    str.gsub!(/\[changeset:(\d+)\]/) { map_changeset(Regexp.last_match[1]) }
+    str.gsub!(/\[milestone:([\d.]+)\s([^\]]+)\]/) { map_milestone(Regexp.last_match[2], Regexp.last_match[1]) }
+    str.gsub!(/\[milestone:([\d.]+)\]/) { map_milestone(nil, Regexp.last_match[1]) }
     # Ticket
     str.gsub!(/ticket:(\d+)/, '#\1')
     # set the body as a comment
-    str.gsub!("\n", "\n> ")
-    str = "> #{str}"
+    #str.gsub!("\n", "\n> ")
+    # str = "> #{str}"
     return str
   end
 end
 
 class Trac
-  attr_reader :tickets, :changes, :sessions, :attachments
+  attr_reader :tickets, :changes, :sessions, :attachments, :milestones, :revisions
+
   def initialize(db)
     $logger.info('loading tickets')
     @db = db
@@ -376,6 +667,8 @@ class Trac
     @changes = @db[:ticket_change]
     @sessions = @db[:session_attribute]
     @attachments = @db[:attachment]
+    @milestones = @db[:milestone]
+    @revisions = @db[:revision]
   end
 end
 
@@ -462,16 +755,18 @@ if __FILE__ == $0
   if opts[:revmapfile]
     File.open(opts[:revmapfile], "r") do |f|
       $logger.info(opts[:revmapfile])
-      revmap = Hash[f.lines
-        .map {|line|    line.split(/\s+/)}
-        .map {|rev,sha| [rev.gsub(/^r/, ''), sha]}  # remove leading "r" if present
+      revmap = Hash[f.each_line
+                     .map { |line| line.split(/\s+/) }
+                     .map { |rev, sha| [rev.gsub(/^r/, ''), sha] } # remove leading "r" if present
       ]
     end
   end
 
   trac = Trac.new(db)
+
   migrator = Migrator.new(
-      trac, cfg['github'], cfg['users'], cfg['labels'], revmap,
-      opts[:attachurl], opts[:singlepost], (not opts[:fast]))
+    trac, cfg['github'], cfg['users'], cfg['labels'], revmap,
+    opts[:attachurl], opts[:singlepost], (not opts[:fast]))
+  #migrator.migrateVersions
   migrator.migrate(opts[:start], opts[:openedonly])
 end
